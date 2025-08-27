@@ -13,8 +13,7 @@ EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 def _join_docs(docs) -> str:
     if not docs:
-        # Allow chatting even without PDFs
-        return "No documents available."
+        return ""  # <- empty context => behave like a normal chatbot
     return "\n\n".join([d.page_content for d in docs])
 
 def build_chain(
@@ -23,36 +22,54 @@ def build_chain(
     collection_name: str = "pdf-chat",
 ):
     # --- Vector store / retriever
+    embeddings = HuggingFaceEmbeddings(
+        model_name=EMBED_MODEL,
+        model_kwargs={"device": "cpu"}  # robust on Windows/CPU
+    )
     vectorstore = Chroma(
         collection_name=collection_name,
         persist_directory=persist_directory,
-        embedding_function=HuggingFaceEmbeddings(
-            model_name=EMBED_MODEL,
-            model_kwargs={"device": "cpu"}  # <-- force CPU to avoid meta tensor error
-        ),
+        embedding_function=embeddings,
     )
     retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+
+    # Helper to know if we actually have any vectors
+    def has_docs() -> bool:
+        try:
+            # LangChain's Chroma wrapper exposes the underlying collection
+            return (vectorstore._collection.count() or 0) > 0  # type: ignore[attr-defined]
+        except Exception:
+            # Fallback: attempt a dummy search and see if anything returns
+            try:
+                _ = retriever.get_relevant_documents("ping")
+                # If no exception, rely on empty results downstream
+                return True
+            except Exception:
+                return False
 
     # --- LLM
     llm = ChatGroq(model=model_name)
 
     # --- Prompt (expects: question, context, history)
     qa_prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are a helpful assistant. Use the provided context to answer."),
+        ("system", "You are a helpful assistant. Use the provided context to answer when it is non-empty. If context is empty, answer normally without fabricating document citations."),
         MessagesPlaceholder("history"),
         ("system", "Context:\n{context}"),
         ("human", "{question}"),
     ])
 
-    # --- Retrieval step: add context AND PRESERVE history
+    # --- Retrieval step: add context (only if docs exist) and PRESERVE history
     def retrieve_step(inputs: Dict[str, Any]) -> Dict[str, Any]:
-        # inputs will already include {"question": ..., "history": [...]} thanks to RunnableWithMessageHistory
         question = inputs["question"] if isinstance(inputs, dict) else str(inputs)
         history = inputs.get("history", []) if isinstance(inputs, dict) else []
-        docs = retriever.get_relevant_documents(question)
+        if has_docs():
+            docs = retriever.get_relevant_documents(question)
+            context = _join_docs(docs)
+        else:
+            context = ""  # => normal chatbot mode (no retrieval)
         return {
             "question": question,
-            "context": _join_docs(docs),
+            "context": context,
             "history": history,  # keep history for the prompt
         }
 
