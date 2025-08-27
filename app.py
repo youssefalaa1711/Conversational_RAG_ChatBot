@@ -1,6 +1,7 @@
 # app.py
 import os
-import shutil  # <-- added
+import uuid
+import shutil
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -8,117 +9,277 @@ from engines.base import ChatEngine
 from engines.rag_engine import RagEngine
 from rag.ingest import ingest_pdfs
 from rag.pipeline import build_chain
+from langchain_groq import ChatGroq  # for auto-titling
 
-# Load .env for GROQ_API_KEY
+# -----------------------------
+# ENV / CONSTANTS
+# -----------------------------
 load_dotenv()
-
-PERSIST_DIR = ".chroma/student-rag"
-COLLECTION = "pdf-chat"
+BASE_CHROMA_DIR = ".chroma"            # base dir for all chats (per-chat subfolders)
+DEFAULT_COLLECTION = "pdf-chat"        # same name OK; folders isolate per chat
+TITLE_MODEL = "llama3-8b-8192"
 
 st.set_page_config(page_title="Conversational RAG Q&A", page_icon="💬", layout="wide")
 
-# --- NEW: ensure the vector store starts empty on first load this session
-if "cleared_on_start" not in st.session_state:
-    shutil.rmtree(PERSIST_DIR, ignore_errors=True)
-    os.makedirs(PERSIST_DIR, exist_ok=True)
-    st.session_state.cleared_on_start = True
+# -----------------------------
+# Minimal CSS to resemble ChatGPT sidebar
+# -----------------------------
+st.markdown("""
+<style>
+section[data-testid="stSidebar"] > div { padding-top: .4rem !important; }
+.app-brand { font-weight:700; font-size:1.1rem; margin:.25rem .25rem .5rem .25rem; }
+.chat-list { height: 48vh; overflow-y: auto; padding-right:.25rem; }
+.chat-item { border-radius:8px; padding:.5rem .6rem; margin-bottom:.15rem; cursor:pointer; }
+.chat-item:hover { background:#f5f5f5; }
+.chat-item.active { background:#e9f0ff; border:1px solid #cfe0ff; }
+.chat-title { font-weight:600; font-size:.95rem; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+.small { font-size:.8rem; color:#666; }
+hr { margin: .6rem 0 .6rem 0; }
+</style>
+""", unsafe_allow_html=True)
 
-st.title("📚 PDF Conversational Assistant")
-st.caption("Upload PDFs and chat with them. Answers are grounded in your documents.")
+st.title("💬 Conversational RAG Q&A")
+st.caption("Multiple chats, each with its own memory and PDFs. Upload files per chat and ask away.")
 
 # -----------------------------
-# API KEY HANDLING
+# API KEY
 # -----------------------------
-def ensure_api_key() -> bool:
-    key = os.getenv("GROQ_API_KEY")
-    if key:
-        st.sidebar.success("🔑 GROQ_API_KEY loaded from environment")
-        return True
+def api_key_ready() -> bool:
+    return bool(os.getenv("GROQ_API_KEY"))
 
-    with st.sidebar:
-        st.warning("No GROQ_API_KEY found in .env. Paste it here (kept only in memory).")
-        pasted = st.text_input("GROQ API key", type="password")
-        if pasted:
-            os.environ["GROQ_API_KEY"] = pasted
-            st.sidebar.success("API key set for this session")
-            return True
-    return False
+def maybe_collect_api_key_ui():
+    # Only show if missing, and not at the top of the sidebar
+    with st.sidebar.expander("Settings", expanded=False):
+        if not api_key_ready():
+            st.warning("No GROQ_API_KEY found in .env. Paste it here (kept only in memory).")
+            pasted = st.text_input("Groq API key", type="password")
+            if pasted:
+                os.environ["GROQ_API_KEY"] = pasted
+                st.success("Key set for this session. You can close this section.")
 
-api_ready = ensure_api_key()
+maybe_collect_api_key_ui()
 
 # -----------------------------
-# SIDEBAR LAYOUT
+# SESSION STATE INIT
+# -----------------------------
+def _init_state():
+    ss = st.session_state
+    if "chat_list" not in ss:
+        ss.chat_list = [{"id": f"chat-{uuid.uuid4().hex[:6]}", "title": "New chat"}]
+    if "active_chat_id" not in ss:
+        ss.active_chat_id = ss.chat_list[0]["id"]
+    if "engines" not in ss:
+        ss.engines = {}         # chat_id -> RagEngine
+    if "stores" not in ss:
+        ss.stores = {}          # chat_id -> LC history store
+    if "ui_histories" not in ss:
+        ss.ui_histories = {}    # chat_id -> [(role, text)]
+    if "docs_loaded" not in ss:
+        ss.docs_loaded = {}     # chat_id -> bool
+    if "titled" not in ss:
+        ss.titled = {}          # chat_id -> bool (title already auto-set?)
+
+_init_state()
+
+# -----------------------------
+# CHAT HELPERS
+# -----------------------------
+def chat_chroma_dir(chat_id: str) -> str:
+    d = os.path.join(BASE_CHROMA_DIR, chat_id)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def ensure_engine_for_chat(chat_id: str) -> ChatEngine:
+    ss = st.session_state
+    if chat_id in ss.engines:
+        return ss.engines[chat_id]
+    persist_dir = chat_chroma_dir(chat_id)
+    chain, store = build_chain(
+        model_name="llama3-8b-8192",
+        persist_directory=persist_dir,
+        collection_name=DEFAULT_COLLECTION,
+    )
+    engine: ChatEngine = RagEngine(chain, store)
+    ss.engines[chat_id] = engine
+    ss.stores[chat_id] = store
+    ss.ui_histories.setdefault(chat_id, [])
+    ss.docs_loaded[chat_id] = any(os.scandir(persist_dir))
+    ss.titled.setdefault(chat_id, False)
+    return engine
+
+def reset_chat(chat_id: str):
+    ss = st.session_state
+    store = ss.stores.get(chat_id)
+    if store is not None:
+        store.clear()
+    ss.ui_histories[chat_id] = []
+    ss.titled[chat_id] = False
+
+def clear_pdfs(chat_id: str):
+    ss = st.session_state
+    persist_dir = chat_chroma_dir(chat_id)
+    shutil.rmtree(persist_dir, ignore_errors=True)
+    os.makedirs(persist_dir, exist_ok=True)
+    ss.docs_loaded[chat_id] = False
+    # rebuild engine so retriever sees empty DB
+    ss.engines.pop(chat_id, None)
+    ss.stores.pop(chat_id, None)
+
+def create_new_chat():
+    ss = st.session_state
+    new_id = f"chat-{uuid.uuid4().hex[:6]}"
+    ss.chat_list.append({"id": new_id, "title": "New chat"})
+    ss.active_chat_id = new_id
+
+def rename_chat(chat_id: str, new_title: str):
+    for c in st.session_state.chat_list:
+        if c["id"] == chat_id:
+            c["title"] = new_title
+            break
+
+def delete_chat(chat_id: str):
+    ss = st.session_state
+    if len(ss.chat_list) == 1:
+        st.warning("At least one chat is required.")
+        return
+    ss.chat_list = [c for c in ss.chat_list if c["id"] != chat_id]
+    ss.ui_histories.pop(chat_id, None)
+    ss.engines.pop(chat_id, None)
+    ss.stores.pop(chat_id, None)
+    shutil.rmtree(chat_chroma_dir(chat_id), ignore_errors=True)
+    ss.active_chat_id = ss.chat_list[0]["id"]
+
+def generate_title(first_user: str, first_bot: str) -> str:
+    """Use the LLM to auto-title the chat in 3–6 words."""
+    try:
+        if not api_key_ready():
+            # fallback: simple heuristic
+            text = (first_user or first_bot or "New chat").strip()
+            return (text[:42] + "…") if len(text) > 45 else text
+        llm = ChatGroq(model=TITLE_MODEL)
+        prompt = (
+            "Create a short, 3–6 word title for this conversation topic. "
+            "Do not use quotes, punctuation at the end, or emojis. "
+            f"\nUser: {first_user}\nAssistant: {first_bot}\nTitle:"
+        )
+        out = llm.invoke(prompt).content.strip()
+        # sanitize
+        out = out.replace('"', '').replace("'", "")
+        return out[:60]
+    except Exception:
+        text = (first_user or first_bot or "New chat").strip()
+        return (text[:42] + "…") if len(text) > 45 else text
+
+# -----------------------------
+# SIDEBAR (ChatGPT-like)
 # -----------------------------
 with st.sidebar:
-    st.header("⚡ Quick Actions")
-    if st.button("Reset Chat"):
-        st.session_state.history_store.clear()
-        st.session_state.chat_history_ui = []
-        st.success("Chat reset!")
+    st.markdown('<div class="app-brand">Chats</div>', unsafe_allow_html=True)
 
-    # --- NEW: clear all PDFs (vector store) on demand
-    if st.button("🗑️ Clear All PDFs"):
-        shutil.rmtree(PERSIST_DIR, ignore_errors=True)
-        os.makedirs(PERSIST_DIR, exist_ok=True)
-        st.success("All PDFs cleared from the vector store.")
+    # Search
+    q = st.text_input("Search chats", value="", label_visibility="collapsed", placeholder="Search chats…")
+    filtered = [c for c in st.session_state.chat_list if q.lower() in c["title"].lower()]
+
+    # List
+    st.markdown('<div class="chat-list">', unsafe_allow_html=True)
+    for c in filtered:
+        active = (c["id"] == st.session_state.active_chat_id)
+        cls = "chat-item active" if active else "chat-item"
+        if st.button(f"  {c['title']}", key=f"sel-{c['id']}", help=c["id"], use_container_width=True):
+            st.session_state.active_chat_id = c["id"]
+            st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # New / rename / delete
+    cols = st.columns([1, 1, 1])
+    if cols[0].button("➕ New"):
+        create_new_chat(); st.rerun()
+    with st.expander("✏️ Rename", expanded=False):
+        current = next(c for c in st.session_state.chat_list if c["id"] == st.session_state.active_chat_id)
+        new_name = st.text_input("New name", value=current["title"])
+        if st.button("Save"):
+            rename_chat(st.session_state.active_chat_id, new_name); st.success("Renamed.")
+    if cols[2].button("🗑️ Delete"):
+        delete_chat(st.session_state.active_chat_id); st.rerun()
 
     st.markdown("---")
-    st.subheader("⚙️ Settings")
-    bubble_color = st.color_picker("Chat bubble color", "#E6F7E6")
+    # Per-chat actions
+    st.caption("This chat")
+    if st.button("Reset chat history"):
+        reset_chat(st.session_state.active_chat_id); st.success("History cleared.")
+    if st.button("Clear PDFs"):
+        clear_pdfs(st.session_state.active_chat_id); st.success("PDFs cleared for this chat.")
+    st.markdown("---")
+    # Appearance
+    st.caption("Appearance")
+    bubble_color = st.color_picker("Your bubble color", "#E6F7E6", label_visibility="collapsed")
 
 # -----------------------------
-# SESSION HANDLING
+# ACTIVE CHAT (engine + state)
 # -----------------------------
-session_id = st.text_input("Session ID", placeholder="e.g., demo-1")
-if "chat_history_ui" not in st.session_state:
-    st.session_state.chat_history_ui = []
+active_id = st.session_state.active_chat_id
+engine = ensure_engine_for_chat(active_id)
 
 # -----------------------------
-# PDF UPLOAD & AUTO-INGEST
+# MAIN: Uploader (top) – per chat
 # -----------------------------
-uploaded_files = st.file_uploader("Upload one or more PDFs", type=["pdf"], accept_multiple_files=True)
+st.subheader("📂 Documents")
+uploaded_files = st.file_uploader(
+    "Upload one or more PDFs",
+    type=["pdf"],
+    accept_multiple_files=True,
+    key=f"uploader-{active_id}",
+    help="Files are stored and used only within this chat."
+)
 
-def _save_uploads(files):
+def _save_uploads(chat_id: str, files):
     paths = []
-    if not files:
-        return paths
-    os.makedirs("uploaded", exist_ok=True)
+    if not files: return paths
+    upload_dir = os.path.join("uploaded", chat_id)
+    os.makedirs(upload_dir, exist_ok=True)
     for f in files:
-        p = os.path.join("uploaded", f.name)
+        p = os.path.join(upload_dir, f.name)
         with open(p, "wb") as out:
             out.write(f.read())
         paths.append(p)
     return paths
 
 if uploaded_files:
-    paths = _save_uploads(uploaded_files)
+    saved = _save_uploads(active_id, uploaded_files)
     try:
-        ingest_pdfs(paths, persist_directory=PERSIST_DIR, collection_name=COLLECTION)
-        st.sidebar.success("📚 PDFs ingested automatically")
+        persist_dir = chat_chroma_dir(active_id)
+        ingest_pdfs(saved, persist_directory=persist_dir, collection_name=DEFAULT_COLLECTION)
+        st.session_state.docs_loaded[active_id] = True
+        st.success(f"📚 Ingested {len(saved)} file(s) into this chat.")
+        # Recreate engine so retriever sees new vectors immediately
+        st.session_state.engines.pop(active_id, None)
+        st.session_state.stores.pop(active_id, None)
+        engine = ensure_engine_for_chat(active_id)
     except Exception as e:
-        st.sidebar.error(f"Ingestion failed: {e}")
+        st.error(f"Ingestion failed: {e}")
+
+# Show list of files for this chat
+chat_upload_dir = os.path.join("uploaded", active_id)
+if os.path.isdir(chat_upload_dir):
+    files = [f.name for f in os.scandir(chat_upload_dir) if f.is_file()]
+    if files:
+        st.write("**Files in this chat:**")
+        st.write("• " + "\n• ".join(files))
+    else:
+        st.caption("No files uploaded for this chat yet.")
+else:
+    st.caption("No files uploaded for this chat yet.")
+
+st.markdown("---")
 
 # -----------------------------
-# BUILD CHAIN ONCE
-# -----------------------------
-if "rag_chain" not in st.session_state:
-    chain, store = build_chain(
-        model_name="llama3-8b-8192",
-        persist_directory=PERSIST_DIR,
-        collection_name=COLLECTION,
-    )
-    st.session_state.rag_chain = chain
-    st.session_state.history_store = store
-    st.session_state.engine: ChatEngine = RagEngine(chain, store)
-
-# -----------------------------
-# CHAT BUBBLE RENDERER
+# Chat bubbles
 # -----------------------------
 def chat_bubble(role, text, color="#E6F7E6"):
     if role == "user":
         st.markdown(
             f"""
-            <div style="background-color:{color}; padding:10px; border-radius:10px; margin:5px 0; text-align:right">
+            <div style="background-color:{color}; padding:10px; border-radius:10px; margin:6px 0; text-align:right">
                 <b>You:</b> {text}
             </div>
             """,
@@ -127,34 +288,43 @@ def chat_bubble(role, text, color="#E6F7E6"):
     else:
         st.markdown(
             f"""
-            <div style="background-color:#F0F0F0; padding:10px; border-radius:10px; margin:5px 0; text-align:left">
+            <div style="background-color:#F0F0F0; padding:10px; border-radius:10px; margin:6px 0; text-align:left">
                 <b>Bot:</b> {text}
             </div>
             """,
             unsafe_allow_html=True,
         )
 
+
 # -----------------------------
 # MAIN CHAT
 # -----------------------------
-st.divider()
 st.subheader("💬 Chat")
+input_hint = "Ask anything… (uses this chat’s PDFs if available)" if st.session_state.docs_loaded.get(active_id, False) \
+    else "Ask anything… (no PDFs loaded for this chat yet)"
+user_q = st.chat_input(input_hint, key=f"chatinput-{active_id}")
 
-if not session_id:
-    st.info("Enter a Session ID to start chatting.")
-else:
-    user_q = st.chat_input("Ask about your PDFs…")
-    if user_q:
-        if not api_ready:
-            st.error("No API key found. Add GROQ_API_KEY to your .env or sidebar.")
-        else:
-            with st.spinner("Thinking…"):
-                ans = st.session_state.engine.answer(session_id, user_q)
+if user_q:
+    if not api_key_ready():
+        st.error("No API key found. Add GROQ_API_KEY to your .env or set it in Settings.")
+    else:
+        with st.spinner("Thinking…"):
+            # use chat_id as the session id for LC memory
+            ans = engine.answer(active_id, user_q)
 
-            # Save to UI history
-            st.session_state.chat_history_ui.append(("user", user_q))
-            st.session_state.chat_history_ui.append(("bot", ans))
+        # save UI transcript
+        st.session_state.ui_histories.setdefault(active_id, []).append(("user", user_q))
+        st.session_state.ui_histories.setdefault(active_id, []).append(("bot", ans))
 
-    # Render conversation
-    for role, msg in st.session_state.chat_history_ui:
-        chat_bubble(role, msg, color=bubble_color if role == "user" else "#F0F0F0")
+        # auto-title on first exchange if still "New chat"
+        chat_meta = next(c for c in st.session_state.chat_list if c["id"] == active_id)
+        if not st.session_state.titled.get(active_id, False):
+            first_user = user_q
+            first_bot = ans
+            new_title = generate_title(first_user, first_bot).strip() or "New chat"
+            chat_meta["title"] = new_title
+            st.session_state.titled[active_id] = True
+
+# Render conversation
+for role, msg in st.session_state.ui_histories.get(active_id, []):
+    chat_bubble(role, msg, color=bubble_color if role == "user" else "#F0F0F0")
