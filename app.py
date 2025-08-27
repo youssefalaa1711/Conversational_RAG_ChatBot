@@ -1,4 +1,4 @@
-# app.py
+# app.py 
 import os
 import uuid
 import shutil
@@ -21,6 +21,9 @@ TITLE_MODEL = "llama3-8b-8192"
 
 st.set_page_config(page_title="Conversational RAG Q&A", page_icon="💬", layout="wide")
 
+# ✅ default user bubble color (used at render)
+bubble_color = "#E6F7E6"
+
 # -----------------------------
 # Minimal CSS to resemble ChatGPT sidebar
 # -----------------------------
@@ -35,6 +38,7 @@ section[data-testid="stSidebar"] > div { padding-top: .4rem !important; }
 .chat-title { font-weight:600; font-size:.95rem; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
 .small { font-size:.8rem; color:#666; }
 hr { margin: .6rem 0 .6rem 0; }
+.tag { display:inline-block; padding:.18rem .45rem; border-radius:999px; border:1px solid #e6e6e6; margin:.1rem .25rem .1rem 0; font-size:.78rem; color:#555; background:#fafafa; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -163,9 +167,8 @@ def generate_title(first_user: str, first_bot: str) -> str:
             f"\nUser: {first_user}\nAssistant: {first_bot}\nTitle:"
         )
         out = llm.invoke(prompt).content.strip()
-        # sanitize
         out = out.replace('"', '').replace("'", "")
-        return out[:60]
+        return out[:60] or "New chat"
     except Exception:
         text = (first_user or first_bot or "New chat").strip()
         return (text[:42] + "…") if len(text) > 45 else text
@@ -184,8 +187,7 @@ with st.sidebar:
     st.markdown('<div class="chat-list">', unsafe_allow_html=True)
     for c in filtered:
         active = (c["id"] == st.session_state.active_chat_id)
-        cls = "chat-item active" if active else "chat-item"
-        if st.button(f"  {c['title']}", key=f"sel-{c['id']}", help=c["id"], use_container_width=True):
+        if st.button(f"{'• ' if active else ''}{c['title']}", key=f"sel-{c['id']}", use_container_width=True):
             st.session_state.active_chat_id = c["id"]
             st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
@@ -203,16 +205,11 @@ with st.sidebar:
         delete_chat(st.session_state.active_chat_id); st.rerun()
 
     st.markdown("---")
-    # Per-chat actions
     st.caption("This chat")
     if st.button("Reset chat history"):
         reset_chat(st.session_state.active_chat_id); st.success("History cleared.")
     if st.button("Clear PDFs"):
         clear_pdfs(st.session_state.active_chat_id); st.success("PDFs cleared for this chat.")
-    st.markdown("---")
-    # Appearance
-    st.caption("Appearance")
-    bubble_color = st.color_picker("Your bubble color", "#E6F7E6", label_visibility="collapsed")
 
 # -----------------------------
 # ACTIVE CHAT (engine + state)
@@ -221,16 +218,13 @@ active_id = st.session_state.active_chat_id
 engine = ensure_engine_for_chat(active_id)
 
 # -----------------------------
-# MAIN: Uploader (top) – per chat
+# 📂 PDF UPLOAD — MINIMAL, PROFESSIONAL (collapsed by default)
 # -----------------------------
-st.subheader("📂 Documents")
-uploaded_files = st.file_uploader(
-    "Upload one or more PDFs",
-    type=["pdf"],
-    accept_multiple_files=True,
-    key=f"uploader-{active_id}",
-    help="Files are stored and used only within this chat."
-)
+with st.expander("➕ Upload PDFs (optional)", expanded=False):
+    uploaded_files = st.file_uploader(
+        "Select PDF(s)", type=["pdf"], accept_multiple_files=True, label_visibility="collapsed",
+        key=f"uploader-{active_id}"
+    )
 
 def _save_uploads(chat_id: str, files):
     paths = []
@@ -244,31 +238,33 @@ def _save_uploads(chat_id: str, files):
         paths.append(p)
     return paths
 
+if 'uploaded_notice' not in st.session_state:
+    st.session_state.uploaded_notice = {}
+
 if uploaded_files:
     saved = _save_uploads(active_id, uploaded_files)
     try:
         persist_dir = chat_chroma_dir(active_id)
         ingest_pdfs(saved, persist_directory=persist_dir, collection_name=DEFAULT_COLLECTION)
         st.session_state.docs_loaded[active_id] = True
-        st.success(f"📚 Ingested {len(saved)} file(s) into this chat.")
-        # Recreate engine so retriever sees new vectors immediately
         st.session_state.engines.pop(active_id, None)
         st.session_state.stores.pop(active_id, None)
         engine = ensure_engine_for_chat(active_id)
+        st.session_state.uploaded_notice[active_id] = f"Ingested {len(saved)} file(s)."
     except Exception as e:
-        st.error(f"Ingestion failed: {e}")
+        st.session_state.uploaded_notice[active_id] = f"Ingestion failed: {e}"
 
-# Show list of files for this chat
+# Subtle one-line files list just under the expander (if any)
 chat_upload_dir = os.path.join("uploaded", active_id)
 if os.path.isdir(chat_upload_dir):
     files = [f.name for f in os.scandir(chat_upload_dir) if f.is_file()]
     if files:
-        st.write("**Files in this chat:**")
-        st.write("• " + "\n• ".join(files))
-    else:
-        st.caption("No files uploaded for this chat yet.")
-else:
-    st.caption("No files uploaded for this chat yet.")
+        st.caption("Files: " + " ".join(f"<span class='tag'>{name}</span>" for name in files), unsafe_allow_html=True)
+
+# Optional small notice after upload
+note = st.session_state.uploaded_notice.get(active_id)
+if note:
+    st.caption(note)
 
 st.markdown("---")
 
@@ -294,7 +290,6 @@ def chat_bubble(role, text, color="#E6F7E6"):
             """,
             unsafe_allow_html=True,
         )
-
 
 # -----------------------------
 # MAIN CHAT
