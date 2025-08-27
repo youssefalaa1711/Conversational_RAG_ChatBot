@@ -1,7 +1,7 @@
 # rag/pipeline.py
 from typing import Dict, Any
 from langchain_community.vectorstores import Chroma
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.embeddings import FastEmbedEmbeddings  # <- no Torch
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnableLambda
@@ -9,11 +9,11 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain.memory import ChatMessageHistory
 from langchain_groq import ChatGroq
 
-EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-
 def _join_docs(docs) -> str:
+    """Join retrieved docs into a single context string.
+    Empty string => behave like a normal chatbot (no retrieval)."""
     if not docs:
-        return ""  # <- empty context => behave like a normal chatbot
+        return ""
     return "\n\n".join([d.page_content for d in docs])
 
 def build_chain(
@@ -21,11 +21,8 @@ def build_chain(
     persist_directory: str = ".chroma/student-rag",
     collection_name: str = "pdf-chat",
 ):
-    # --- Vector store / retriever
-    embeddings = HuggingFaceEmbeddings(
-        model_name=EMBED_MODEL,
-        model_kwargs={"device": "cpu"}  # robust on Windows/CPU
-    )
+    # --- Vector store / retriever (Torch-free embeddings)
+    embeddings = FastEmbedEmbeddings()  # fast, CPU-only, no meta-tensor issues
     vectorstore = Chroma(
         collection_name=collection_name,
         persist_directory=persist_directory,
@@ -33,26 +30,22 @@ def build_chain(
     )
     retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
 
-    # Helper to know if we actually have any vectors
+    # Helper: do we actually have any vectors?
     def has_docs() -> bool:
         try:
-            # LangChain's Chroma wrapper exposes the underlying collection
-            return (vectorstore._collection.count() or 0) > 0  # type: ignore[attr-defined]
+            count = vectorstore._collection.count()  # private attr but reliable
+            return bool(count and count > 0)
         except Exception:
-            # Fallback: attempt a dummy search and see if anything returns
-            try:
-                _ = retriever.get_relevant_documents("ping")
-                # If no exception, rely on empty results downstream
-                return True
-            except Exception:
-                return False
+            # If we can't read the count, default to NO docs to avoid accidental retrieval
+            return False
 
     # --- LLM
     llm = ChatGroq(model=model_name)
 
     # --- Prompt (expects: question, context, history)
     qa_prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are a helpful assistant. Use the provided context to answer when it is non-empty. If context is empty, answer normally without fabricating document citations."),
+        ("system", "You are a helpful assistant. Use the provided context to answer when it is non-empty. "
+                   "If context is empty, answer normally without fabricating document citations."),
         MessagesPlaceholder("history"),
         ("system", "Context:\n{context}"),
         ("human", "{question}"),
@@ -60,6 +53,7 @@ def build_chain(
 
     # --- Retrieval step: add context (only if docs exist) and PRESERVE history
     def retrieve_step(inputs: Dict[str, Any]) -> Dict[str, Any]:
+        # RunnableWithMessageHistory supplies {"question": ..., "history": [...]}
         question = inputs["question"] if isinstance(inputs, dict) else str(inputs)
         history = inputs.get("history", []) if isinstance(inputs, dict) else []
         if has_docs():
@@ -67,18 +61,9 @@ def build_chain(
             context = _join_docs(docs)
         else:
             context = ""  # => normal chatbot mode (no retrieval)
-        return {
-            "question": question,
-            "context": context,
-            "history": history,  # keep history for the prompt
-        }
+        return {"question": question, "context": context, "history": history}
 
-    rag_chain = (
-        RunnableLambda(retrieve_step)
-        | qa_prompt
-        | llm
-        | StrOutputParser()
-    )
+    rag_chain = RunnableLambda(retrieve_step) | qa_prompt | llm | StrOutputParser()
 
     # --- History store
     store: Dict[str, ChatMessageHistory] = {}
@@ -92,8 +77,8 @@ def build_chain(
     chain_with_history = RunnableWithMessageHistory(
         rag_chain,
         get_session_history,
-        input_messages_key="question",   # user’s message key
-        history_messages_key="history",  # messages placeholder name in the prompt
+        input_messages_key="question",
+        history_messages_key="history",
     )
 
     return chain_with_history, store

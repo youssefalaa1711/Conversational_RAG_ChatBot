@@ -73,15 +73,17 @@ def _init_state():
     if "active_chat_id" not in ss:
         ss.active_chat_id = ss.chat_list[0]["id"]
     if "engines" not in ss:
-        ss.engines = {}         # chat_id -> RagEngine
+        ss.engines = {}
     if "stores" not in ss:
-        ss.stores = {}          # chat_id -> LC history store
+        ss.stores = {}
     if "ui_histories" not in ss:
-        ss.ui_histories = {}    # chat_id -> [(role, text)]
+        ss.ui_histories = {}
     if "docs_loaded" not in ss:
-        ss.docs_loaded = {}     # chat_id -> bool
+        ss.docs_loaded = {}
     if "titled" not in ss:
-        ss.titled = {}          # chat_id -> bool (title already auto-set?)
+        ss.titled = {}
+    if "uploader_version" not in ss:
+        ss.uploader_version = {}   # <-- added here
 
 _init_state()
 
@@ -121,13 +123,38 @@ def reset_chat(chat_id: str):
 
 def clear_pdfs(chat_id: str):
     ss = st.session_state
-    persist_dir = chat_chroma_dir(chat_id)
+
+    # 1) Wipe persisted Chroma collection for this chat
+    persist_dir = os.path.join(BASE_CHROMA_DIR, chat_id)
     shutil.rmtree(persist_dir, ignore_errors=True)
     os.makedirs(persist_dir, exist_ok=True)
-    ss.docs_loaded[chat_id] = False
-    # rebuild engine so retriever sees empty DB
+
+    # 2) Wipe uploaded source files (the ones listed under the expander)
+    upload_dir = os.path.join("uploaded", chat_id)
+    shutil.rmtree(upload_dir, ignore_errors=True)
+
+    # 3) Clear conversation history (so no PDF-derived memory remains)
+    store = ss.stores.get(chat_id)
+    if store is not None:
+        try:
+            store.clear()
+        except Exception:
+            pass
+    ss.ui_histories[chat_id] = []
+    ss.titled[chat_id] = False  # optional: allow a new auto-title
+
+    # 4) Drop live engine & store so retriever is recreated against empty DB
     ss.engines.pop(chat_id, None)
     ss.stores.pop(chat_id, None)
+
+    # 5) Flags & notices
+    ss.docs_loaded[chat_id] = False
+    if "uploaded_notice" in ss:
+        ss.uploaded_notice.pop(chat_id, None)
+
+    # 6) Reset the file_uploader widget by bumping its version
+    ss.uploader_version[chat_id] = ss.uploader_version.get(chat_id, 0) + 1
+
 
 def create_new_chat():
     ss = st.session_state
@@ -209,7 +236,11 @@ with st.sidebar:
     if st.button("Reset chat history"):
         reset_chat(st.session_state.active_chat_id); st.success("History cleared.")
     if st.button("Clear PDFs"):
-        clear_pdfs(st.session_state.active_chat_id); st.success("PDFs cleared for this chat.")
+        clear_pdfs(st.session_state.active_chat_id)
+        st.success("PDFs and chat memory cleared for this chat.")
+        st.rerun()  # force UI to rebuild (uploader will show blank; tags disappear)
+
+
 
 # -----------------------------
 # ACTIVE CHAT (engine + state)
@@ -220,11 +251,17 @@ engine = ensure_engine_for_chat(active_id)
 # -----------------------------
 # 📂 PDF UPLOAD — MINIMAL, PROFESSIONAL (collapsed by default)
 # -----------------------------
+# 📂 PDF UPLOAD — MINIMAL, PROFESSIONAL (collapsed by default)
 with st.expander("➕ Upload PDFs (optional)", expanded=False):
+    up_ver = st.session_state.uploader_version.get(active_id, 0)
     uploaded_files = st.file_uploader(
-        "Select PDF(s)", type=["pdf"], accept_multiple_files=True, label_visibility="collapsed",
-        key=f"uploader-{active_id}"
+        "Select PDF(s)",
+        type=["pdf"],
+        accept_multiple_files=True,
+        label_visibility="collapsed",
+        key=f"uploader-{active_id}-{up_ver}",  # versioned key
     )
+
 
 def _save_uploads(chat_id: str, files):
     paths = []
