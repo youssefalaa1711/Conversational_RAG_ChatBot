@@ -17,7 +17,7 @@ def _join_docs(docs) -> str:
     return "\n\n".join([d.page_content for d in docs])
 
 def build_chain(
-    model_name: str = "llama3-8b-8192",
+    model_name: str = "llama-3.1-8b-instant",
     persist_directory: str = ".chroma/student-rag",
     collection_name: str = "pdf-chat",
 ):

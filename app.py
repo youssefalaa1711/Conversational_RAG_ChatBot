@@ -17,7 +17,7 @@ from langchain_groq import ChatGroq  # for auto-titling
 load_dotenv()
 BASE_CHROMA_DIR = ".chroma"            # base dir for all chats (per-chat subfolders)
 DEFAULT_COLLECTION = "pdf-chat"        # same name OK; folders isolate per chat
-TITLE_MODEL = "llama3-8b-8192"
+TITLE_MODEL = "llama-3.1-8b-instant"
 
 st.set_page_config(page_title="Conversational RAG Q&A", page_icon="💬", layout="wide")
 
@@ -101,7 +101,7 @@ def ensure_engine_for_chat(chat_id: str) -> ChatEngine:
         return ss.engines[chat_id]
     persist_dir = chat_chroma_dir(chat_id)
     chain, store = build_chain(
-        model_name="llama3-8b-8192",
+        model_name="llama-3.1-8b-instant",
         persist_directory=persist_dir,
         collection_name=DEFAULT_COLLECTION,
     )
