@@ -1,6 +1,6 @@
 # 💬 Conversational RAG Q&A with PDFs
 
-This project is a **ChatGPT-style conversational assistant** that lets you upload PDFs and chat with them.  
+This project is a **conversational assistant** that lets you upload PDFs and chat with them.  
 Each chat has its own memory and its own documents, so you can maintain multiple parallel conversations with different contexts.  
 
 Built with **Streamlit**, **LangChain**, **ChromaDB**, **Groq LLMs**, and **PDF ingestion pipelines**.
